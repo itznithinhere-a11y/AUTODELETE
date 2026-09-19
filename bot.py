@@ -29,10 +29,12 @@ from aiogram.types import (
 
 # IMPORTANT:
 # Apna NEW regenerated Telegram bot token yahan lagao.
-BOT_TOKEN = "8689250126:AAEqVBh3J4zUCU09M5BEtW4JExc1Si8_blw"
+BOT_TOKEN = "PUT_NEW_BOT_TOKEN_HERE"
 
 SUPABASE_URL = "https://isgnfbbxkarlomtueyzd.supabase.co"
 
+# IMPORTANT:
+# Apni NEW regenerated Supabase SERVICE ROLE KEY yahan lagao.
 SUPABASE_SERVICE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImlzZ25mYmJ4a2FybG9tdHVleXpkIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4OTMwMTIzMSwiZXhwIjoyMTA0ODc3MjMxfQ.JkHK0cbvl6olJY817BPpiWM9xkMo-lWgbO7gcc3NQzI"
 
 ADMIN_IDS = {
@@ -111,6 +113,10 @@ message_queue = asyncio.Queue(
 )
 
 active_jobs = set()
+
+# Jobs which are requested to stop.
+# job_id -> True
+cancelled_jobs = set()
 
 
 # =========================================================
@@ -450,6 +456,8 @@ MAIN_TEXT = (
     "/delete 10m\n"
     "/delete 1h\n"
     "/delete 1d\n\n"
+    "🛑 Running delete stop karne ke liye:\n"
+    "/stopdelete\n\n"
     "📌 Maximum: 30 days"
 )
 
@@ -467,6 +475,8 @@ GUIDE_TEXT = (
     "/delete 37m\n"
     "/delete 13h\n"
     "/delete 5d\n\n"
+    "🛑 Delete process stop karne ke liye:\n"
+    "/stopdelete\n\n"
     "📌 Maximum: 30 days\n\n"
     "⚡ Message tracking Supabase me save hoti hai.\n"
     "🔄 Bot restart ke baad data safe rahega."
@@ -731,7 +741,6 @@ async def message_db_worker():
                         "MESSAGE BATCH SAVE ERROR"
                     )
 
-                    # Retry individually
                     for item in current_batch:
 
                         try:
@@ -789,10 +798,6 @@ async def message_db_worker():
 # =========================================================
 # TRACK GROUP MESSAGES
 # =========================================================
-
-# IMPORTANT:
-# Command messages are excluded here.
-# This prevents /delete from being swallowed by this handler.
 
 @router.message(
     F.chat.type.in_({
@@ -964,6 +969,61 @@ async def delete_one_message(
 
 
 # =========================================================
+# CHECK IF JOB IS CANCELLED
+# =========================================================
+
+async def is_job_cancelled(job_id):
+
+    # Fast local check
+    if job_id in cancelled_jobs:
+        return True
+
+    # Persistent DB check
+    try:
+
+        rows = await db_select(
+            "delete_jobs",
+            params=[
+                (
+                    "id",
+                    f"eq.{job_id}",
+                ),
+                (
+                    "select",
+                    "status",
+                ),
+                (
+                    "limit",
+                    "1",
+                ),
+            ],
+        )
+
+        if rows:
+
+            status = rows[0].get(
+                "status"
+            )
+
+            if status == "cancelled":
+
+                cancelled_jobs.add(
+                    job_id
+                )
+
+                return True
+
+    except Exception:
+
+        logger.exception(
+            "CHECK JOB CANCELLED ERROR | job=%s",
+            job_id,
+        )
+
+    return False
+
+
+# =========================================================
 # GET JOB MESSAGES
 # =========================================================
 
@@ -975,6 +1035,13 @@ async def get_job_messages(job):
     page_size = 1000
 
     while True:
+
+        # Stop loading more DB pages if job
+        # was cancelled.
+        if await is_job_cancelled(
+            job["id"]
+        ):
+            break
 
         rows = await db_select(
             "tracked_messages",
@@ -1016,7 +1083,6 @@ async def get_job_messages(job):
 
         offset += page_size
 
-        # Safety
         if offset >= 200000:
             break
 
@@ -1035,7 +1101,6 @@ async def delete_tracked_records(
     if not message_ids:
         return
 
-    # Avoid giant URL
     chunk_size = 100
 
     for i in range(
@@ -1085,6 +1150,7 @@ async def process_delete_job(
 ):
 
     job_id = job["id"]
+
     chat_id = int(
         job["chat_id"]
     )
@@ -1099,6 +1165,22 @@ async def process_delete_job(
         async with job_semaphore:
 
             async with delete_locks[chat_id]:
+
+                # -------------------------------------------------
+                # Check cancellation before starting
+                # -------------------------------------------------
+
+                if await is_job_cancelled(
+                    job_id
+                ):
+
+                    logger.info(
+                        "DELETE JOB ALREADY CANCELLED | job=%s | chat=%s",
+                        job_id,
+                        chat_id,
+                    )
+
+                    return
 
                 logger.info(
                     "DELETE JOB START | job=%s | chat=%s | duration=%s",
@@ -1115,6 +1197,7 @@ async def process_delete_job(
                     "delete_jobs",
                     {
                         "id": f"eq.{job_id}",
+                        "status": "eq.pending",
                     },
                     {
                         "status": "processing",
@@ -1124,6 +1207,12 @@ async def process_delete_job(
                     },
                 )
 
+                # Check again after DB update
+                if await is_job_cancelled(
+                    job_id
+                ):
+                    return
+
                 # -------------------------------------------------
                 # Get messages
                 # -------------------------------------------------
@@ -1131,6 +1220,18 @@ async def process_delete_job(
                 rows = await get_job_messages(
                     job
                 )
+
+                # If cancelled while fetching
+                if await is_job_cancelled(
+                    job_id
+                ):
+
+                    logger.info(
+                        "DELETE JOB CANCELLED DURING FETCH | job=%s",
+                        job_id,
+                    )
+
+                    return
 
                 total = len(rows)
 
@@ -1168,6 +1269,75 @@ async def process_delete_job(
                     rows,
                     start=1,
                 ):
+
+                    # =================================================
+                    # STOP CHECK
+                    # =================================================
+
+                    if await is_job_cancelled(
+                        job_id
+                    ):
+
+                        logger.info(
+                            "DELETE JOB STOPPED | job=%s | deleted=%s/%s",
+                            job_id,
+                            deleted,
+                            total,
+                        )
+
+                        # Remove DB records for messages
+                        # that were successfully deleted.
+                        await delete_tracked_records(
+                            chat_id,
+                            successfully_deleted_ids,
+                        )
+
+                        # Persistent cancelled status
+                        await db_update(
+                            "delete_jobs",
+                            {
+                                "id": f"eq.{job_id}",
+                            },
+                            {
+                                "status": "cancelled",
+                                "deleted": deleted,
+                                "failed": failed,
+                                "skipped_admin": skipped_admin,
+                                "skipped_pinned": skipped_pinned,
+                                "media_counts": dict(
+                                    media_counts
+                                ),
+                                "completed_at": utc_iso(
+                                    time.time()
+                                ),
+                                "error_message": (
+                                    "Stopped by admin."
+                                ),
+                            },
+                        )
+
+                        try:
+
+                            await bot.send_message(
+                                chat_id=chat_id,
+                                text=(
+                                    "🛑 Delete Stopped\n\n"
+                                    f"🗑 Deleted: {deleted}\n"
+                                    f"📦 Found: {total}\n"
+                                    f"👮 Admin skipped: {skipped_admin}\n"
+                                    f"📌 Pinned skipped: {skipped_pinned}\n"
+                                    f"❌ Failed: {failed}\n\n"
+                                    "⛔ Delete process admin ne stop kar diya."
+                                ),
+                            )
+
+                        except Exception:
+
+                            logger.exception(
+                                "STOP MESSAGE ERROR"
+                            )
+
+                        return
 
                     message_id = int(
                         row["message_id"]
@@ -1234,6 +1404,44 @@ async def process_delete_job(
                             index,
                             total,
                         )
+
+                # -------------------------------------------------
+                # Final stop check
+                # -------------------------------------------------
+
+                if await is_job_cancelled(
+                    job_id
+                ):
+
+                    await delete_tracked_records(
+                        chat_id,
+                        successfully_deleted_ids,
+                    )
+
+                    await db_update(
+                        "delete_jobs",
+                        {
+                            "id": f"eq.{job_id}",
+                        },
+                        {
+                            "status": "cancelled",
+                            "deleted": deleted,
+                            "failed": failed,
+                            "skipped_admin": skipped_admin,
+                            "skipped_pinned": skipped_pinned,
+                            "media_counts": dict(
+                                media_counts
+                            ),
+                            "completed_at": utc_iso(
+                                time.time()
+                            ),
+                            "error_message": (
+                                "Stopped by admin."
+                            ),
+                        },
+                    )
+
+                    return
 
                 # -------------------------------------------------
                 # Remove successfully deleted DB records
@@ -1413,6 +1621,10 @@ def start_job(
     if job_id in active_jobs:
         return
 
+    # Never start cancelled jobs
+    if job_id in cancelled_jobs:
+        return
+
     asyncio.create_task(
         process_delete_job(
             bot,
@@ -1431,8 +1643,8 @@ async def recover_jobs(
 
     try:
 
-        # Any processing job left by previous
-        # crashed/restarted instance becomes pending.
+        # Processing jobs left by previous
+        # crashed/restarted instance become pending.
         await db_update(
             "delete_jobs",
             {
@@ -1547,10 +1759,6 @@ async def delete_job_worker(
 # DELETE COMMAND
 # =========================================================
 
-# =========================================================
-# DELETE COMMAND - GROUP ADMIN ONLY
-# =========================================================
-
 @router.message(
     Command("delete"),
     F.chat.type.in_({
@@ -1561,6 +1769,7 @@ async def delete_job_worker(
 async def delete_handler(
     message: Message,
 ):
+
     if not message.text:
         return
 
@@ -1578,42 +1787,51 @@ async def delete_handler(
     # =====================================================
 
     try:
+
         user_member = await message.bot.get_chat_member(
             chat_id=message.chat.id,
             user_id=user_id,
         )
 
-        # Only group owner/admin allowed
         if user_member.status not in {
             "administrator",
             "creator",
         }:
+
             await message.reply(
                 "❌ Sirf Group Admin / Owner "
                 "/delete command use kar sakta hai."
             )
+
             return
 
     except TelegramNetworkError:
+
         await message.reply(
             "⚠️ Telegram network error aaya.\n"
             "Thodi der baad try karo."
         )
+
         return
 
     except TelegramForbiddenError:
+
         await message.reply(
             "❌ Admin status check nahi ho paaya."
         )
+
         return
 
     except TelegramBadRequest:
+
         await message.reply(
             "❌ User admin status check nahi ho paaya."
         )
+
         return
 
     except Exception:
+
         logger.exception(
             "GROUP ADMIN CHECK ERROR | chat=%s | user=%s",
             message.chat.id,
@@ -1623,6 +1841,7 @@ async def delete_handler(
         await message.reply(
             "❌ Admin permission check failed."
         )
+
         return
 
     # =====================================================
@@ -1632,6 +1851,7 @@ async def delete_handler(
     args = message.text.split()
 
     if len(args) < 2:
+
         await message.reply(
             "❌ Time missing.\n\n"
             "Examples:\n"
@@ -1642,6 +1862,7 @@ async def delete_handler(
             "/delete 1d\n"
             "/delete 7d"
         )
+
         return
 
     duration_text = (
@@ -1655,6 +1876,7 @@ async def delete_handler(
     )
 
     if seconds is None:
+
         await message.reply(
             "❌ Invalid time.\n\n"
             "Use:\n"
@@ -1668,6 +1890,7 @@ async def delete_handler(
             "/delete 7d\n\n"
             f"📌 Maximum: {MAX_TRACK_DAYS}d"
         )
+
         return
 
     command_time = time.time()
@@ -1681,6 +1904,7 @@ async def delete_handler(
     # =====================================================
 
     try:
+
         me = await message.bot.get_me()
 
         member = await message.bot.get_chat_member(
@@ -1692,11 +1916,13 @@ async def delete_handler(
             "administrator",
             "creator",
         }:
+
             await message.reply(
                 "❌ Bot admin nahi hai.\n\n"
                 "Bot ko Administrator banao aur "
                 "Delete Messages permission ON karo."
             )
+
             return
 
         if member.status == "administrator":
@@ -1708,34 +1934,43 @@ async def delete_handler(
             )
 
             if not can_delete:
+
                 await message.reply(
                     "❌ Bot ke paas "
                     "Delete Messages "
                     "permission nahi hai."
                 )
+
                 return
 
     except TelegramNetworkError:
+
         await message.reply(
             "⚠️ Telegram network error aaya.\n"
             "Thodi der baad try karo."
         )
+
         return
 
     except TelegramForbiddenError:
+
         await message.reply(
             "❌ Permission check reject hua.\n"
             "Bot ko group Administrator banao."
         )
+
         return
 
     except TelegramBadRequest:
+
         await message.reply(
             "❌ Bot permission check failed."
         )
+
         return
 
     except Exception:
+
         logger.exception(
             "BOT PERMISSION CHECK ERROR"
         )
@@ -1743,6 +1978,7 @@ async def delete_handler(
         await message.reply(
             "❌ Bot permission check nahi ho paayi."
         )
+
         return
 
     # =====================================================
@@ -1750,6 +1986,7 @@ async def delete_handler(
     # =====================================================
 
     try:
+
         await db_insert(
             "tracked_messages",
             {
@@ -1764,6 +2001,7 @@ async def delete_handler(
         )
 
     except Exception:
+
         logger.exception(
             "COMMAND MESSAGE SAVE ERROR"
         )
@@ -1775,6 +2013,7 @@ async def delete_handler(
     job = None
 
     try:
+
         rows = await db_insert(
             "delete_jobs",
             {
@@ -1794,9 +2033,11 @@ async def delete_handler(
         )
 
         if rows and isinstance(rows, list):
+
             job = rows[0]
 
     except Exception:
+
         logger.exception(
             "CREATE DELETE JOB ERROR"
         )
@@ -1805,6 +2046,7 @@ async def delete_handler(
             "❌ Delete job create nahi ho paayi.\n"
             "Database error."
         )
+
         return
 
     # =====================================================
@@ -1814,6 +2056,7 @@ async def delete_handler(
     if not job:
 
         try:
+
             latest = await db_select(
                 "delete_jobs",
                 params=[
@@ -1844,6 +2087,7 @@ async def delete_handler(
                 job = latest[0]
 
         except Exception:
+
             logger.exception(
                 "GET CREATED JOB ERROR"
             )
@@ -1858,6 +2102,8 @@ async def delete_handler(
         f"⏱ Range: {duration_text}\n"
         "⚡ Delete process queue me hai.\n"
         "🔄 Restart ke baad bhi job recover hogi.\n\n"
+        "🛑 Stop karne ke liye:\n"
+        "/stopdelete\n\n"
         "📌 Command ke baad aane wale "
         "messages is request me delete nahi honge."
     )
@@ -1867,6 +2113,7 @@ async def delete_handler(
     # =====================================================
 
     if job:
+
         start_job(
             message.bot,
             job,
@@ -1879,6 +2126,211 @@ async def delete_handler(
         duration_text,
         job.get("id") if job else None,
     )
+
+
+# =========================================================
+# STOP DELETE COMMAND
+# =========================================================
+
+@router.message(
+    Command("stopdelete"),
+    F.chat.type.in_({
+        "group",
+        "supergroup",
+    }),
+)
+async def stop_delete_handler(
+    message: Message,
+):
+
+    if not message.from_user:
+        return
+
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+
+    # =====================================================
+    # GROUP ADMIN CHECK
+    # =====================================================
+
+    try:
+
+        user_member = await message.bot.get_chat_member(
+            chat_id=chat_id,
+            user_id=user_id,
+        )
+
+        if user_member.status not in {
+            "administrator",
+            "creator",
+        }:
+
+            await message.reply(
+                "❌ Sirf Group Admin / Owner "
+                "/stopdelete command use kar sakta hai."
+            )
+
+            return
+
+    except TelegramNetworkError:
+
+        await message.reply(
+            "⚠️ Telegram network error aaya.\n"
+            "Thodi der baad try karo."
+        )
+
+        return
+
+    except TelegramForbiddenError:
+
+        await message.reply(
+            "❌ Admin status check nahi ho paaya."
+        )
+
+        return
+
+    except TelegramBadRequest:
+
+        await message.reply(
+            "❌ User admin status check nahi ho paaya."
+        )
+
+        return
+
+    except Exception:
+
+        logger.exception(
+            "STOP GROUP ADMIN CHECK ERROR | chat=%s | user=%s",
+            chat_id,
+            user_id,
+        )
+
+        await message.reply(
+            "❌ Admin permission check failed."
+        )
+
+        return
+
+    # =====================================================
+    # FIND ACTIVE/PENDING JOBS
+    # =====================================================
+
+    try:
+
+        jobs = await db_select(
+            "delete_jobs",
+            params=[
+                (
+                    "chat_id",
+                    f"eq.{chat_id}",
+                ),
+                (
+                    "status",
+                    "in.(pending,processing)",
+                ),
+                (
+                    "order",
+                    "created_at.asc",
+                ),
+                (
+                    "limit",
+                    "100",
+                ),
+            ],
+        )
+
+    except Exception:
+
+        logger.exception(
+            "GET ACTIVE JOBS FOR STOP ERROR | chat=%s",
+            chat_id,
+        )
+
+        await message.reply(
+            "❌ Active delete jobs database se fetch nahi ho paayi."
+        )
+
+        return
+
+    if not jobs:
+
+        await message.reply(
+            "ℹ️ Is group me koi active delete process nahi chal raha."
+        )
+
+        return
+
+    # =====================================================
+    # CANCEL JOBS
+    # =====================================================
+
+    stopped_count = 0
+
+    for job in jobs:
+
+        job_id = job["id"]
+
+        # Local immediate cancellation
+        cancelled_jobs.add(
+            job_id
+        )
+
+        try:
+
+            await db_update(
+                "delete_jobs",
+                {
+                    "id": f"eq.{job_id}",
+                    "status": "in.(pending,processing)",
+                },
+                {
+                    "status": "cancelled",
+                    "completed_at": utc_iso(
+                        time.time()
+                    ),
+                    "error_message": (
+                        f"Stopped by group admin {user_id}."
+                    ),
+                },
+            )
+
+            stopped_count += 1
+
+            logger.info(
+                "DELETE JOB CANCEL REQUESTED | job=%s | chat=%s | admin=%s",
+                job_id,
+                chat_id,
+                user_id,
+            )
+
+        except Exception:
+
+            logger.exception(
+                "STOP JOB DB UPDATE ERROR | job=%s | chat=%s",
+                job_id,
+                chat_id,
+            )
+
+    # =====================================================
+    # RESULT
+    # =====================================================
+
+    if stopped_count:
+
+        await message.reply(
+            "🛑 Delete Process Stopped\n\n"
+            f"⛔ Stopped Jobs: {stopped_count}\n\n"
+            "Jo messages already delete ho chuke hain "
+            "unhe restore nahi kiya ja sakta.\n\n"
+            "Agar delete process chal raha tha, "
+            "woh next stop-check par terminate ho jayega."
+        )
+
+    else:
+
+        await message.reply(
+            "ℹ️ Koi delete job stop nahi hui."
+        )
 
 
 # =========================================================
@@ -1900,6 +2352,25 @@ async def private_delete_handler(
             "Example:\n"
             "/delete 5m"
         )
+
+
+# =========================================================
+# PRIVATE STOPDELETE
+# =========================================================
+
+@router.message(
+    Command("stopdelete"),
+    F.chat.type == "private",
+)
+async def private_stop_delete_handler(
+    message: Message,
+):
+
+    await message.answer(
+        "ℹ️ /stopdelete group/supergroup me use karo.\n\n"
+        "👮 Sirf Group Admin / Owner active delete process ko stop kar sakta hai."
+    )
+
 
 # =========================================================
 # GET BROADCAST USERS
@@ -2143,7 +2614,6 @@ async def broadcast_handler(
 
     async with broadcast_lock:
 
-        # Moderate concurrency to avoid Telegram flood limits.
         concurrency = 8
 
         for start in range(
@@ -2401,13 +2871,28 @@ async def stats_handler(
             ],
         )
 
+        cancelled = await get_exact_count(
+            "delete_jobs",
+            params=[
+                (
+                    "select",
+                    "id",
+                ),
+                (
+                    "status",
+                    "eq.cancelled",
+                ),
+            ],
+        )
+
         await message.answer(
             "📊 Bot Statistics\n\n"
             f"👥 Users: {users}\n\n"
             f"💬 Tracked Messages: {tracked}\n\n"
             f"⏳ Pending Jobs: {pending}\n"
             f"⚙️ Processing Jobs: {processing}\n"
-            f"✅ Completed Jobs: {completed}\n\n"
+            f"✅ Completed Jobs: {completed}\n"
+            f"🛑 Cancelled Jobs: {cancelled}\n\n"
             "💾 Storage: Supabase\n"
             f"⏱ Tracking: {MAX_TRACK_DAYS} days"
         )
@@ -2624,7 +3109,7 @@ async def main():
     if (
         not SUPABASE_SERVICE_KEY
         or SUPABASE_SERVICE_KEY
-        == "PUT_SUPABASE_SERVICE_ROLE_KEY_HERE"
+        == "PUT_NEW_SUPABASE_SERVICE_ROLE_KEY_HERE"
     ):
 
         raise RuntimeError(
@@ -2720,6 +3205,10 @@ async def main():
         logger.info(
             "ADMIN IDS: %s",
             list(ADMIN_IDS),
+        )
+
+        logger.info(
+            "STOP COMMAND: /stopdelete"
         )
 
         logger.info(
