@@ -2,11 +2,21 @@ import asyncio
 import logging
 import re
 import time
-from collections import defaultdict, deque
+from collections import defaultdict
+
+import httpx
 
 from aiogram import Bot, Dispatcher, Router, F
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramNetworkError,
+    TelegramRetryAfter,
+    TelegramUnauthorizedError,
+)
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
+    CallbackQuery,
     Message,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
@@ -18,47 +28,48 @@ from aiogram.types import (
 # =========================================================
 
 # IMPORTANT:
-# Apna NEW BotFather token yahan daalo.
-BOT_TOKEN = "8845241436:AAHEesCMnaZjVF3QIxUPsSF0HeoM4Gb8GZo"
+# Apna NEW regenerated Telegram bot token yahan lagao.
+BOT_TOKEN = "8689250126:AAEqVBh3J4zUCU09M5BEtW4JExc1Si8_blw"
 
+SUPABASE_URL = "https://isgnfbbxkarlomtueyzd.supabase.co"
 
-# =========================================================
-# ADMIN CONFIG
-# =========================================================
-
-# Yahan apna Telegram numeric user ID daalo.
-#
-# Example:
-# ADMIN_IDS = {
-#     123456789,
-#     987654321,
-# }
-#
-# Multiple admins bhi add kar sakte ho.
+SUPABASE_SERVICE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImlzZ25mYmJ4a2FybG9tdHVleXpkIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4OTMwMTIzMSwiZXhwIjoyMTA0ODc3MjMxfQ.JkHK0cbvl6olJY817BPpiWM9xkMo-lWgbO7gcc3NQzI"
 
 ADMIN_IDS = {
     6594401737,
 }
 
+UPDATE_CHANNEL_URL = "https://t.me/YOUR_UPDATE_CHANNEL"
+
 
 # =========================================================
-# SETTINGS
+# GENERAL CONFIG
 # =========================================================
 
-# Maximum /delete duration
 MAX_TRACK_DAYS = 30
-
 TRACK_SECONDS = MAX_TRACK_DAYS * 24 * 60 * 60
 
-# Delay between delete requests
+# Message DB batching
+MESSAGE_BATCH_SIZE = 100
+MESSAGE_BATCH_INTERVAL = 0.25
+MESSAGE_QUEUE_MAX = 20000
+
+# Telegram deletion
 DELETE_DELAY = 0.05
 
-# Worker check interval
-JOB_CHECK_INTERVAL = 1
+# Maximum simultaneous delete jobs
+MAX_PARALLEL_DELETE_JOBS = 10
 
-# Broadcast delay
-# Telegram flood-limit avoid karne ke liye
+# Job checking
+JOB_CHECK_INTERVAL = 1.0
+
+# Broadcast
 BROADCAST_DELAY = 0.05
+BROADCAST_PROGRESS_EVERY = 10
+
+# Poll reconnect
+POLL_RETRY_MIN = 2
+POLL_RETRY_MAX = 30
 
 
 # =========================================================
@@ -77,79 +88,275 @@ logger = logging.getLogger("DeleteBot")
 # TELEGRAM
 # =========================================================
 
-bot = Bot(token=BOT_TOKEN)
-
 dp = Dispatcher()
-
 router = Router()
 
 dp.include_router(router)
 
 
 # =========================================================
-# MEMORY STORAGE
+# RUNTIME STORAGE
 # =========================================================
-
-# ---------------------------------------------------------
-# GROUP MESSAGE HISTORY
-# ---------------------------------------------------------
-#
-# chat_id -> deque([
-#     {
-#         "message_id": 123,
-#         "timestamp": 1234567890
-#     }
-# ])
-#
-# ---------------------------------------------------------
-
-message_history = defaultdict(deque)
 
 delete_locks = defaultdict(asyncio.Lock)
 
-pending_jobs = deque()
-
-
-# =========================================================
-# BROADCAST USER STORAGE
-# =========================================================
-#
-# RAM ONLY
-#
-# User /start karega to uska ID yahan store hoga.
-#
-# Bot restart hone ke baad users reset ho jayenge.
-#
-# =========================================================
-
-broadcast_users = set()
-
-
-# =========================================================
-# BROADCAST LOCK
-# =========================================================
+job_semaphore = asyncio.Semaphore(
+    MAX_PARALLEL_DELETE_JOBS
+)
 
 broadcast_lock = asyncio.Lock()
 
+message_queue = asyncio.Queue(
+    maxsize=MESSAGE_QUEUE_MAX
+)
+
+active_jobs = set()
+
 
 # =========================================================
-# DURATION PARSER
+# SUPABASE CLIENT
 # =========================================================
+
+supabase_client = None
+
+
+def create_supabase_client():
+
+    return httpx.AsyncClient(
+        base_url=f"{SUPABASE_URL.rstrip('/')}/rest/v1",
+        headers={
+            "apikey": SUPABASE_SERVICE_KEY,
+            "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+            "Content-Type": "application/json",
+        },
+        timeout=httpx.Timeout(
+            connect=10,
+            read=60,
+            write=60,
+            pool=60,
+        ),
+        limits=httpx.Limits(
+            max_connections=100,
+            max_keepalive_connections=30,
+        ),
+    )
+
+
+# =========================================================
+# DATABASE REQUEST
+# =========================================================
+
+async def db_request(
+    method: str,
+    path: str,
+    *,
+    params=None,
+    json_data=None,
+    headers=None,
+):
+    """
+    Async Supabase REST request.
+    """
+
+    if supabase_client is None:
+        raise RuntimeError(
+            "Supabase client is not initialized."
+        )
+
+    request_headers = {}
+
+    if headers:
+        request_headers.update(headers)
+
+    last_error = None
+
+    for attempt in range(5):
+
+        try:
+
+            response = await supabase_client.request(
+                method=method,
+                url=f"/{path}",
+                params=params,
+                json=json_data,
+                headers=request_headers,
+            )
+
+            # Success
+            if 200 <= response.status_code < 300:
+
+                if not response.content:
+                    return []
+
+                try:
+                    return response.json()
+                except Exception:
+                    return []
+
+            # Rate limit
+            if response.status_code == 429:
+
+                logger.warning(
+                    "SUPABASE RATE LIMIT | path=%s | attempt=%s",
+                    path,
+                    attempt + 1,
+                )
+
+                await asyncio.sleep(
+                    min(2 + attempt, 10)
+                )
+
+                continue
+
+            # Server error
+            if response.status_code >= 500:
+
+                logger.warning(
+                    "SUPABASE SERVER ERROR | path=%s | status=%s | attempt=%s",
+                    path,
+                    response.status_code,
+                    attempt + 1,
+                )
+
+                await asyncio.sleep(
+                    min(1 + attempt, 5)
+                )
+
+                continue
+
+            raise RuntimeError(
+                f"Supabase HTTP {response.status_code}: "
+                f"{response.text[:1500]}"
+            )
+
+        except (
+            httpx.TimeoutException,
+            httpx.NetworkError,
+        ) as e:
+
+            last_error = e
+
+            logger.warning(
+                "SUPABASE NETWORK ERROR | path=%s | attempt=%s | %s",
+                path,
+                attempt + 1,
+                e,
+            )
+
+            if attempt < 4:
+                await asyncio.sleep(
+                    min(1 + attempt, 5)
+                )
+
+    raise RuntimeError(
+        f"Supabase request failed: {last_error}"
+    )
+
+
+# =========================================================
+# DATABASE HELPERS
+# =========================================================
+
+async def db_insert(
+    table,
+    data,
+    *,
+    upsert=False,
+    return_data=False,
+):
+    prefer_parts = []
+
+    if upsert:
+        prefer_parts.append(
+            "resolution=merge-duplicates"
+        )
+
+    if return_data:
+        prefer_parts.append(
+            "return=representation"
+        )
+    else:
+        prefer_parts.append(
+            "return=minimal"
+        )
+
+    return await db_request(
+        "POST",
+        table,
+        json_data=data,
+        headers={
+            "Prefer": ",".join(
+                prefer_parts
+            )
+        },
+    )
+
+
+async def db_select(
+    table,
+    params=None,
+):
+    return await db_request(
+        "GET",
+        table,
+        params=params,
+    )
+
+
+async def db_update(
+    table,
+    params,
+    data,
+):
+    return await db_request(
+        "PATCH",
+        table,
+        params=params,
+        json_data=data,
+        headers={
+            "Prefer": "return=minimal",
+        },
+    )
+
+
+async def db_delete(
+    table,
+    params,
+):
+    return await db_request(
+        "DELETE",
+        table,
+        params=params,
+        headers={
+            "Prefer": "return=minimal",
+        },
+    )
+
+
+# =========================================================
+# HELPERS
+# =========================================================
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
 
 def parse_duration(value: str):
+
+    if not value:
+        return None
 
     value = value.lower().strip()
 
     match = re.fullmatch(
         r"(\d+)([mhd])",
-        value
+        value,
     )
 
     if not match:
         return None
 
     number = int(match.group(1))
-
     unit = match.group(2)
 
     if number <= 0:
@@ -161,11 +368,8 @@ def parse_duration(value: str):
     elif unit == "h":
         seconds = number * 60 * 60
 
-    elif unit == "d":
-        seconds = number * 24 * 60 * 60
-
     else:
-        return None
+        seconds = number * 24 * 60 * 60
 
     if seconds > TRACK_SECONDS:
         return None
@@ -173,503 +377,1271 @@ def parse_duration(value: str):
     return seconds
 
 
-# =========================================================
-# ADD MESSAGE TO MEMORY
-# =========================================================
+def utc_iso(timestamp: float) -> str:
 
-def add_message_to_history(
-    chat_id: int,
-    message_id: int,
-    message_time: float,
-):
-
-    history = message_history[chat_id]
-
-    history.append(
-        {
-            "message_id": message_id,
-            "timestamp": message_time,
-        }
+    return time.strftime(
+        "%Y-%m-%dT%H:%M:%SZ",
+        time.gmtime(timestamp),
     )
 
-    cutoff = message_time - TRACK_SECONDS
 
-    while history and history[0]["timestamp"] < cutoff:
-        history.popleft()
+def get_media_type(message: Message) -> str:
+
+    if message.video:
+        return "video"
+
+    if message.photo:
+        return "photo"
+
+    if message.document:
+        return "document"
+
+    if message.audio:
+        return "audio"
+
+    if message.voice:
+        return "voice"
+
+    if message.video_note:
+        return "video_note"
+
+    if message.animation:
+        return "animation"
+
+    if message.sticker:
+        return "sticker"
+
+    if message.contact:
+        return "contact"
+
+    if message.location:
+        return "location"
+
+    if message.poll:
+        return "poll"
+
+    if message.dice:
+        return "dice"
+
+    if message.text:
+        return "text"
+
+    return "other"
 
 
-# =========================================================
-# GET MESSAGES FOR DELETE RANGE
-# =========================================================
+async def safe_sleep(seconds):
 
-def get_messages_for_range(
-    chat_id: int,
-    start_time: float,
-    end_time: float,
-):
-
-    history = message_history.get(
-        chat_id,
-        deque()
+    await asyncio.sleep(
+        max(0, seconds)
     )
 
-    result = []
-
-    for item in history:
-
-        timestamp = item["timestamp"]
-
-        if start_time <= timestamp <= end_time:
-
-            result.append(item)
-
-    return result
-
 
 # =========================================================
-# CHECK ADMIN
+# MAIN UI
 # =========================================================
 
-def is_admin(user_id: int):
-
-    return user_id in ADMIN_IDS
-
-
-# =========================================================
-# DELETE JOB
-# =========================================================
-
-async def process_delete_job(job):
-
-    chat_id = job["chat_id"]
-
-    start_time = job["start_time"]
-
-    end_time = job["end_time"]
-
-    duration_text = job["duration_text"]
-
-    logger.info(
-        "DELETE JOB START | chat=%s | duration=%s",
-        chat_id,
-        duration_text,
-    )
-
-    async with delete_locks[chat_id]:
-
-        rows = get_messages_for_range(
-            chat_id=chat_id,
-            start_time=start_time,
-            end_time=end_time,
-        )
-
-        total = len(rows)
-
-        logger.info(
-            "MESSAGES FOUND | chat=%s | total=%s",
-            chat_id,
-            total,
-        )
-
-        deleted = 0
-
-        failed = 0
-
-        successfully_deleted_ids = set()
-
-        # -------------------------------------------------
-        # DELETE
-        # -------------------------------------------------
-
-        for index, row in enumerate(rows, start=1):
-
-            message_id = row["message_id"]
-
-            try:
-
-                await bot.delete_message(
-                    chat_id=chat_id,
-                    message_id=message_id,
-                )
-
-                deleted += 1
-
-                successfully_deleted_ids.add(
-                    message_id
-                )
-
-                logger.info(
-                    "DELETED | chat=%s | msg=%s | %s/%s",
-                    chat_id,
-                    message_id,
-                    index,
-                    total,
-                )
-
-            except Exception as e:
-
-                failed += 1
-
-                logger.warning(
-                    "DELETE FAILED | chat=%s | msg=%s | %s",
-                    chat_id,
-                    message_id,
-                    e,
-                )
-
-            await asyncio.sleep(
-                DELETE_DELAY
-            )
-
-        # -------------------------------------------------
-        # REMOVE ONLY SUCCESSFULLY DELETED MESSAGES
-        # -------------------------------------------------
-
-        history = message_history.get(
-            chat_id
-        )
-
-        if history and successfully_deleted_ids:
-
-            remaining = deque()
-
-            for item in history:
-
-                if item["message_id"] not in successfully_deleted_ids:
-
-                    remaining.append(item)
-
-            message_history[chat_id] = remaining
-
-        # -------------------------------------------------
-        # RESULT
-        # -------------------------------------------------
-
-        logger.info(
-            "DELETE JOB COMPLETE | chat=%s | total=%s | deleted=%s | failed=%s",
-            chat_id,
-            total,
-            deleted,
-            failed,
-        )
-
-        return deleted, failed
-
-
-# =========================================================
-# DELETE WORKER
-# =========================================================
-
-async def delete_worker():
-
-    logger.info(
-        "DELETE WORKER STARTED"
-    )
-
-    while True:
-
-        try:
-
-            if pending_jobs:
-
-                job = pending_jobs.popleft()
-
-                try:
-
-                    deleted, failed = await process_delete_job(
-                        job
-                    )
-
-                    logger.info(
-                        "JOB RESULT | deleted=%s | failed=%s",
-                        deleted,
-                        failed,
-                    )
-
-                except Exception as e:
-
-                    logger.exception(
-                        "DELETE JOB ERROR | chat=%s | %s",
-                        job["chat_id"],
-                        e,
-                    )
-
-            else:
-
-                await asyncio.sleep(
-                    JOB_CHECK_INTERVAL
-                )
-
-        except Exception as e:
-
-            logger.exception(
-                "WORKER ERROR | %s",
-                e,
-            )
-
-            await asyncio.sleep(2)
-
-
-# =========================================================
-# START COMMAND
-# =========================================================
-
-@router.message(CommandStart())
-async def start_handler(
-    message: Message
-):
-
-    # -----------------------------------------------------
-    # SAVE USER FOR BROADCAST
-    # -----------------------------------------------------
-
-    if message.from_user:
-
-        broadcast_users.add(
-            message.from_user.id
-        )
-
-        logger.info(
-            "USER REGISTERED | user=%s | total=%s",
-            message.from_user.id,
-            len(broadcast_users),
-        )
-
-    # -----------------------------------------------------
-    # ADD TO GROUP URL
-    # -----------------------------------------------------
-
-    me = await bot.get_me()
+MAIN_TEXT = (
+    "🤖 Message Delete Bot\n\n"
+    "👋 Welcome!\n\n"
+    "Group me bot add karo aur "
+    "Administrator + Delete Messages "
+    "permission do.\n\n"
+    "Uske baad group me:\n"
+    "/delete 10m\n"
+    "/delete 1h\n"
+    "/delete 1d\n\n"
+    "📌 Maximum: 30 days"
+)
+
+
+GUIDE_TEXT = (
+    "📖 Guide\n\n"
+    "1️⃣ Bot ko group me add karo.\n\n"
+    "2️⃣ Bot ko Administrator banao.\n\n"
+    "3️⃣ Delete Messages permission ON karo.\n\n"
+    "4️⃣ BotFather me /setprivacy ko "
+    "Disable karo.\n\n"
+    "5️⃣ Group me command use karo:\n"
+    "/delete 10m\n\n"
+    "Custom examples:\n"
+    "/delete 37m\n"
+    "/delete 13h\n"
+    "/delete 5d\n\n"
+    "📌 Maximum: 30 days\n\n"
+    "⚡ Message tracking Supabase me save hoti hai.\n"
+    "🔄 Bot restart ke baad data safe rahega."
+)
+
+
+def main_keyboard(bot_username: str):
 
     add_url = (
-        f"https://t.me/{me.username}"
+        f"https://t.me/"
+        f"{bot_username}"
         f"?startgroup=true"
     )
 
-    keyboard = InlineKeyboardMarkup(
+    return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
                     text="➕ Add Me to Group",
                     url=add_url,
-                )
+                ),
+                InlineKeyboardButton(
+                    text="📢 Update Channel",
+                    url=UPDATE_CHANNEL_URL,
+                ),
             ],
             [
                 InlineKeyboardButton(
-                    text="📖 Help",
-                    callback_data="help",
+                    text="📖 Guide",
+                    callback_data="guide",
                 )
             ],
         ]
     )
 
-    await message.answer(
 
-        "🤖 Message Delete Bot\n\n"
+def guide_keyboard():
 
-        "👋 Welcome!\n\n"
-
-        "Group me bot add karo aur "
-        "Administrator + Delete Messages "
-        "permission do.\n\n"
-
-        "Uske baad group me koi bhi user "
-        "delete command use kar sakta hai.\n\n"
-
-        "🗑 Delete Commands\n\n"
-
-        "🗑 /delete 5m\n"
-        "🗑 /delete 10m\n"
-        "🗑 /delete 1h\n"
-        "🗑 /delete 2h\n"
-        "🗑 /delete 1d\n"
-        "🗑 /delete 7d\n\n"
-
-        "✨ Custom Duration\n\n"
-
-        "🔹 /delete 7m\n"
-        "🔹 /delete 37m\n"
-        "🔹 /delete 13h\n"
-        "🔹 /delete 5d\n\n"
-
-        f"📌 Maximum: {MAX_TRACK_DAYS} days\n\n"
-
-        "⚡ Messages RAM me temporarily track hote hain.\n"
-        "⚠️ Bot restart hone par old tracking reset ho jayegi.\n\n"
-
-        "📢 Broadcast: Admin broadcast system enabled.",
-
-        reply_markup=keyboard,
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🔙 Back",
+                    callback_data="back_main",
+                )
+            ]
+        ]
     )
 
 
 # =========================================================
-# HELP COMMAND
+# SAVE USER
 # =========================================================
 
-@router.message(Command("help"))
-async def help_handler(
-    message: Message
-):
+async def save_user(message: Message):
 
-    await message.answer(
+    if not message.from_user:
+        return
 
-        "📖 Message Delete Bot Help\n\n"
+    user = message.from_user
 
-        "🗑 COMMAND\n"
-        "/delete TIME\n\n"
+    try:
 
-        "Examples:\n"
+        await db_insert(
+            "bot_users",
+            {
+                "user_id": user.id,
+            },
+            upsert=True,
+        )
 
-        "/delete 1m → 1 minute\n"
-        "/delete 5m → 5 minutes\n"
-        "/delete 10m → 10 minutes\n"
-        "/delete 30m → 30 minutes\n\n"
+    except Exception:
 
-        "/delete 1h → 1 hour\n"
-        "/delete 2h → 2 hours\n"
-        "/delete 10h → 10 hours\n\n"
-
-        "/delete 1d → 1 day\n"
-        "/delete 2d → 2 days\n"
-        "/delete 7d → 7 days\n"
-        "/delete 30d → 30 days\n\n"
-
-        "✨ Custom Values\n\n"
-
-        "🔹 /delete 7m\n"
-        "🔹 /delete 17m\n"
-        "🔹 /delete 43m\n"
-        "🔹 /delete 3h\n"
-        "🔹 /delete 11h\n"
-        "🔹 /delete 5d\n\n"
-
-        "📌 Units\n"
-        "🕐 m = minutes\n"
-        "🕐 h = hours\n"
-        "🕐 d = days\n\n"
-
-        "📦 Text, photo, video, sticker, GIF, "
-        "document, audio aur supported messages "
-        "delete kiye ja sakte hain.\n\n"
-
-        "⚠️ Bot ko Administrator + "
-        "Delete Messages permission chahiye.\n\n"
-
-        "📢 Admin: /broadcast\n"
-        "📊 Admin: /stats\n\n"
-
-        "⚠️ Bot restart hone par old message tracking "
-        "aur broadcast users reset ho jayenge."
-    )
+        logger.exception(
+            "SAVE USER ERROR | user=%s",
+            user.id,
+        )
 
 
 # =========================================================
-# HELP BUTTON
+# START
 # =========================================================
 
-@router.callback_query(F.data == "help")
-async def help_button_handler(
-    callback
+@router.message(CommandStart())
+async def start_handler(message: Message):
+
+    if not message.from_user:
+        return
+
+    await save_user(message)
+
+    try:
+
+        bot_user = await message.bot.get_me()
+
+        if not bot_user.username:
+
+            await message.answer(
+                "❌ Bot username available nahi hai."
+            )
+
+            return
+
+        await message.answer(
+            MAIN_TEXT,
+            reply_markup=main_keyboard(
+                bot_user.username
+            ),
+        )
+
+    except Exception:
+
+        logger.exception(
+            "START HANDLER ERROR"
+        )
+
+
+# =========================================================
+# GUIDE
+# =========================================================
+
+@router.callback_query(
+    F.data == "guide"
+)
+async def guide_button_handler(
+    callback: CallbackQuery,
 ):
 
     await callback.answer()
 
-    await callback.message.answer(
+    if callback.message:
 
-        "📖 Quick Help\n\n"
+        await callback.message.edit_text(
+            GUIDE_TEXT,
+            reply_markup=guide_keyboard(),
+        )
 
-        "🗑 /delete 5m → 5 minutes\n"
-        "🗑 /delete 1h → 1 hour\n"
-        "🗑 /delete 1d → 1 day\n"
-        "🗑 /delete 7d → 7 days\n\n"
 
-        "✨ Custom Time\n"
+# =========================================================
+# BACK
+# =========================================================
 
-        "🔹 /delete 17m\n"
-        "🔹 /delete 3h\n"
-        "🔹 /delete 5d\n\n"
+@router.callback_query(
+    F.data == "back_main"
+)
+async def back_main_handler(
+    callback: CallbackQuery,
+):
 
-        "⚠️ Bot ko Administrator + "
-        "Delete Messages permission chahiye."
+    await callback.answer()
+
+    if not callback.message:
+        return
+
+    bot_user = await callback.bot.get_me()
+
+    if bot_user.username:
+
+        await callback.message.edit_text(
+            MAIN_TEXT,
+            reply_markup=main_keyboard(
+                bot_user.username
+            ),
+        )
+
+
+# =========================================================
+# MESSAGE QUEUE
+# =========================================================
+
+async def queue_message_for_db(
+    message: Message,
+):
+
+    sender_id = (
+        message.from_user.id
+        if message.from_user
+        else 0
     )
+
+    item = {
+        "chat_id": message.chat.id,
+        "message_id": message.message_id,
+        "sender_id": sender_id,
+        "media_type": get_media_type(message),
+        "message_time": utc_iso(
+            message.date.timestamp()
+        ),
+    }
+
+    try:
+
+        message_queue.put_nowait(
+            item
+        )
+
+    except asyncio.QueueFull:
+
+        logger.error(
+            "MESSAGE QUEUE FULL | chat=%s | msg=%s",
+            message.chat.id,
+            message.message_id,
+        )
+
+
+# =========================================================
+# MESSAGE DB WORKER
+# =========================================================
+
+async def message_db_worker():
+
+    logger.info(
+        "MESSAGE DB WORKER STARTED"
+    )
+
+    batch = []
+
+    while True:
+
+        try:
+
+            try:
+
+                item = await asyncio.wait_for(
+                    message_queue.get(),
+                    timeout=MESSAGE_BATCH_INTERVAL,
+                )
+
+                batch.append(item)
+
+            except asyncio.TimeoutError:
+
+                pass
+
+            if (
+                batch
+                and (
+                    len(batch)
+                    >= MESSAGE_BATCH_SIZE
+                    or message_queue.empty()
+                )
+            ):
+
+                current_batch = batch
+                batch = []
+
+                try:
+
+                    await db_insert(
+                        "tracked_messages",
+                        current_batch,
+                    )
+
+                    logger.debug(
+                        "MESSAGE BATCH SAVED | count=%s",
+                        len(current_batch),
+                    )
+
+                except Exception:
+
+                    logger.exception(
+                        "MESSAGE BATCH SAVE ERROR"
+                    )
+
+                    # Retry individually
+                    for item in current_batch:
+
+                        try:
+
+                            await db_insert(
+                                "tracked_messages",
+                                item,
+                            )
+
+                        except Exception:
+
+                            logger.exception(
+                                "MESSAGE SAVE FAILED | chat=%s | msg=%s",
+                                item["chat_id"],
+                                item["message_id"],
+                            )
+
+                finally:
+
+                    for _ in current_batch:
+
+                        try:
+                            message_queue.task_done()
+                        except Exception:
+                            pass
+
+        except asyncio.CancelledError:
+
+            if batch:
+
+                try:
+
+                    await db_insert(
+                        "tracked_messages",
+                        batch,
+                    )
+
+                except Exception:
+
+                    logger.exception(
+                        "FINAL MESSAGE FLUSH ERROR"
+                    )
+
+            raise
+
+        except Exception:
+
+            logger.exception(
+                "MESSAGE DB WORKER ERROR"
+            )
+
+            await asyncio.sleep(1)
 
 
 # =========================================================
 # TRACK GROUP MESSAGES
 # =========================================================
 
+# IMPORTANT:
+# Command messages are excluded here.
+# This prevents /delete from being swallowed by this handler.
+
 @router.message(
     F.chat.type.in_({
         "group",
-        "supergroup"
+        "supergroup",
     }),
     ~F.text.startswith("/"),
 )
 async def track_group_message(
-    message: Message
+    message: Message,
 ):
 
-    chat_id = message.chat.id
-
-    message_id = message.message_id
-
-    now = time.time()
-
-    add_message_to_history(
-        chat_id=chat_id,
-        message_id=message_id,
-        message_time=now,
+    await queue_message_for_db(
+        message
     )
 
-    logger.debug(
-        "TRACKED | chat=%s | msg=%s",
-        chat_id,
-        message_id,
+
+# =========================================================
+# PROTECTED MESSAGES
+# =========================================================
+
+async def get_protected_message_ids(
+    bot: Bot,
+    chat_id: int,
+):
+
+    admin_ids = set()
+    pinned_ids = set()
+
+    # -----------------------------------------------------
+    # Administrators
+    # -----------------------------------------------------
+
+    try:
+
+        admins = await bot.get_chat_administrators(
+            chat_id
+        )
+
+        admin_ids = {
+            member.user.id
+            for member in admins
+            if member.status in {
+                "administrator",
+                "creator",
+            }
+        }
+
+    except Exception:
+
+        logger.exception(
+            "GET ADMINS ERROR | chat=%s",
+            chat_id,
+        )
+
+    # -----------------------------------------------------
+    # Pinned message
+    # -----------------------------------------------------
+
+    try:
+
+        chat = await bot.get_chat(
+            chat_id
+        )
+
+        pinned = getattr(
+            chat,
+            "pinned_message",
+            None,
+        )
+
+        if pinned:
+
+            pinned_ids.add(
+                pinned.message_id
+            )
+
+    except Exception:
+
+        logger.exception(
+            "GET PINNED ERROR | chat=%s",
+            chat_id,
+        )
+
+    return admin_ids, pinned_ids
+
+
+# =========================================================
+# DELETE ONE MESSAGE
+# =========================================================
+
+async def delete_one_message(
+    bot: Bot,
+    chat_id: int,
+    message_id: int,
+):
+
+    while True:
+
+        try:
+
+            await bot.delete_message(
+                chat_id=chat_id,
+                message_id=message_id,
+            )
+
+            return True
+
+        except TelegramRetryAfter as e:
+
+            wait = (
+                float(e.retry_after)
+                + 0.5
+            )
+
+            logger.warning(
+                "DELETE FLOOD WAIT | chat=%s | msg=%s | wait=%.1f",
+                chat_id,
+                message_id,
+                wait,
+            )
+
+            await safe_sleep(
+                wait
+            )
+
+        except TelegramNetworkError as e:
+
+            logger.warning(
+                "DELETE NETWORK ERROR | chat=%s | msg=%s | %s",
+                chat_id,
+                message_id,
+                e,
+            )
+
+            await safe_sleep(2)
+
+        except TelegramForbiddenError as e:
+
+            logger.warning(
+                "DELETE FORBIDDEN | chat=%s | msg=%s | %s",
+                chat_id,
+                message_id,
+                e,
+            )
+
+            return False
+
+        except TelegramBadRequest as e:
+
+            logger.warning(
+                "DELETE BAD REQUEST | chat=%s | msg=%s | %s",
+                chat_id,
+                message_id,
+                e,
+            )
+
+            return False
+
+        except Exception:
+
+            logger.exception(
+                "DELETE UNKNOWN ERROR | chat=%s | msg=%s",
+                chat_id,
+                message_id,
+            )
+
+            return False
+
+
+# =========================================================
+# GET JOB MESSAGES
+# =========================================================
+
+async def get_job_messages(job):
+
+    all_rows = []
+
+    offset = 0
+    page_size = 1000
+
+    while True:
+
+        rows = await db_select(
+            "tracked_messages",
+            params=[
+                (
+                    "chat_id",
+                    f"eq.{job['chat_id']}",
+                ),
+                (
+                    "message_time",
+                    f"gte.{job['start_time']}",
+                ),
+                (
+                    "message_time",
+                    f"lte.{job['end_time']}",
+                ),
+                (
+                    "order",
+                    "message_time.asc",
+                ),
+                (
+                    "limit",
+                    str(page_size),
+                ),
+                (
+                    "offset",
+                    str(offset),
+                ),
+            ],
+        )
+
+        if not rows:
+            break
+
+        all_rows.extend(rows)
+
+        if len(rows) < page_size:
+            break
+
+        offset += page_size
+
+        # Safety
+        if offset >= 200000:
+            break
+
+    return all_rows
+
+
+# =========================================================
+# DELETE TRACKED RECORDS IN BATCH
+# =========================================================
+
+async def delete_tracked_records(
+    chat_id: int,
+    message_ids,
+):
+
+    if not message_ids:
+        return
+
+    # Avoid giant URL
+    chunk_size = 100
+
+    for i in range(
+        0,
+        len(message_ids),
+        chunk_size,
+    ):
+
+        chunk = message_ids[
+            i:i + chunk_size
+        ]
+
+        ids_text = ",".join(
+            str(int(x))
+            for x in chunk
+        )
+
+        try:
+
+            await db_delete(
+                "tracked_messages",
+                {
+                    "chat_id": (
+                        f"eq.{chat_id}"
+                    ),
+                    "message_id": (
+                        f"in.({ids_text})"
+                    ),
+                },
+            )
+
+        except Exception:
+
+            logger.exception(
+                "TRACKED RECORD DELETE ERROR | chat=%s",
+                chat_id,
+            )
+
+
+# =========================================================
+# PROCESS DELETE JOB
+# =========================================================
+
+async def process_delete_job(
+    bot: Bot,
+    job,
+):
+
+    job_id = job["id"]
+    chat_id = int(
+        job["chat_id"]
     )
+
+    if job_id in active_jobs:
+        return
+
+    active_jobs.add(job_id)
+
+    try:
+
+        async with job_semaphore:
+
+            async with delete_locks[chat_id]:
+
+                logger.info(
+                    "DELETE JOB START | job=%s | chat=%s | duration=%s",
+                    job_id,
+                    chat_id,
+                    job["duration_text"],
+                )
+
+                # -------------------------------------------------
+                # Mark processing
+                # -------------------------------------------------
+
+                await db_update(
+                    "delete_jobs",
+                    {
+                        "id": f"eq.{job_id}",
+                    },
+                    {
+                        "status": "processing",
+                        "started_at": utc_iso(
+                            time.time()
+                        ),
+                    },
+                )
+
+                # -------------------------------------------------
+                # Get messages
+                # -------------------------------------------------
+
+                rows = await get_job_messages(
+                    job
+                )
+
+                total = len(rows)
+
+                deleted = 0
+                failed = 0
+                skipped_admin = 0
+                skipped_pinned = 0
+
+                successfully_deleted_ids = []
+
+                media_counts = defaultdict(int)
+
+                logger.info(
+                    "MESSAGES FOUND | job=%s | total=%s",
+                    job_id,
+                    total,
+                )
+
+                # -------------------------------------------------
+                # Protected IDs
+                # -------------------------------------------------
+
+                admin_ids, pinned_ids = (
+                    await get_protected_message_ids(
+                        bot,
+                        chat_id,
+                    )
+                )
+
+                # -------------------------------------------------
+                # Delete
+                # -------------------------------------------------
+
+                for index, row in enumerate(
+                    rows,
+                    start=1,
+                ):
+
+                    message_id = int(
+                        row["message_id"]
+                    )
+
+                    sender_id = int(
+                        row.get(
+                            "sender_id",
+                            0,
+                        )
+                    )
+
+                    media_type = row.get(
+                        "media_type",
+                        "text",
+                    )
+
+                    # Pinned
+                    if message_id in pinned_ids:
+
+                        skipped_pinned += 1
+                        continue
+
+                    # Admin
+                    if (
+                        sender_id
+                        and sender_id in admin_ids
+                    ):
+
+                        skipped_admin += 1
+                        continue
+
+                    ok = await delete_one_message(
+                        bot=bot,
+                        chat_id=chat_id,
+                        message_id=message_id,
+                    )
+
+                    if ok:
+
+                        deleted += 1
+
+                        media_counts[
+                            media_type
+                        ] += 1
+
+                        successfully_deleted_ids.append(
+                            message_id
+                        )
+
+                    else:
+
+                        failed += 1
+
+                    await safe_sleep(
+                        DELETE_DELAY
+                    )
+
+                    if index % 100 == 0:
+
+                        logger.info(
+                            "DELETE PROGRESS | job=%s | %s/%s",
+                            job_id,
+                            index,
+                            total,
+                        )
+
+                # -------------------------------------------------
+                # Remove successfully deleted DB records
+                # -------------------------------------------------
+
+                await delete_tracked_records(
+                    chat_id,
+                    successfully_deleted_ids,
+                )
+
+                # -------------------------------------------------
+                # Result
+                # -------------------------------------------------
+
+                result = {
+                    "total": total,
+                    "deleted": deleted,
+                    "failed": failed,
+                    "skipped_admin": skipped_admin,
+                    "skipped_pinned": skipped_pinned,
+                    "media_counts": dict(
+                        media_counts
+                    ),
+                }
+
+                # -------------------------------------------------
+                # Complete Job
+                # -------------------------------------------------
+
+                await db_update(
+                    "delete_jobs",
+                    {
+                        "id": f"eq.{job_id}",
+                    },
+                    {
+                        "status": "completed",
+                        "total": total,
+                        "deleted": deleted,
+                        "failed": failed,
+                        "skipped_admin": skipped_admin,
+                        "skipped_pinned": skipped_pinned,
+                        "media_counts": dict(
+                            media_counts
+                        ),
+                        "completed_at": utc_iso(
+                            time.time()
+                        ),
+                        "error_message": None,
+                    },
+                )
+
+                logger.info(
+                    "DELETE JOB COMPLETE | job=%s | chat=%s | total=%s | deleted=%s | failed=%s",
+                    job_id,
+                    chat_id,
+                    total,
+                    deleted,
+                    failed,
+                )
+
+                # -------------------------------------------------
+                # Completion Message
+                # -------------------------------------------------
+
+                try:
+
+                    labels = {
+                        "text": "💬 Text",
+                        "video": "🎥 Video",
+                        "photo": "🖼 Photo",
+                        "document": "📄 Document",
+                        "audio": "🎵 Audio",
+                        "voice": "🎙 Voice",
+                        "video_note": "⭕ Video Note",
+                        "animation": "🎞 Animation",
+                        "sticker": "🏷 Sticker",
+                        "contact": "👤 Contact",
+                        "location": "📍 Location",
+                        "poll": "📊 Poll",
+                        "dice": "🎲 Dice",
+                        "other": "📦 Other",
+                    }
+
+                    media_lines = []
+
+                    for key, label in labels.items():
+
+                        count = media_counts.get(
+                            key,
+                            0,
+                        )
+
+                        if count:
+
+                            media_lines.append(
+                                f"{label}: {count}"
+                            )
+
+                    media_text = (
+                        "\n".join(
+                            media_lines
+                        )
+                        if media_lines
+                        else "—"
+                    )
+
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=(
+                            "✅ Delete Complete\n\n"
+                            f"🗑 Deleted: {deleted}\n"
+                            f"📦 Found: {total}\n"
+                            f"👮 Admin skipped: {skipped_admin}\n"
+                            f"📌 Pinned skipped: {skipped_pinned}\n"
+                            f"❌ Failed: {failed}\n\n"
+                            "Deleted Types\n"
+                            f"{media_text}"
+                        ),
+                    )
+
+                except Exception:
+
+                    logger.exception(
+                        "COMPLETION MESSAGE ERROR"
+                    )
+
+    except asyncio.CancelledError:
+
+        raise
+
+    except Exception as e:
+
+        logger.exception(
+            "DELETE JOB ERROR | job=%s | chat=%s",
+            job_id,
+            chat_id,
+        )
+
+        try:
+
+            await db_update(
+                "delete_jobs",
+                {
+                    "id": f"eq.{job_id}",
+                },
+                {
+                    "status": "pending",
+                    "error_message": str(e)[:2000],
+                },
+            )
+
+        except Exception:
+
+            logger.exception(
+                "FAILED TO RESET JOB | job=%s",
+                job_id,
+            )
+
+    finally:
+
+        active_jobs.discard(
+            job_id
+        )
+
+
+# =========================================================
+# START JOB
+# =========================================================
+
+def start_job(
+    bot: Bot,
+    job,
+):
+
+    job_id = job["id"]
+
+    if job_id in active_jobs:
+        return
+
+    asyncio.create_task(
+        process_delete_job(
+            bot,
+            job,
+        )
+    )
+
+
+# =========================================================
+# RECOVER JOBS
+# =========================================================
+
+async def recover_jobs(
+    bot: Bot,
+):
+
+    try:
+
+        # Any processing job left by previous
+        # crashed/restarted instance becomes pending.
+        await db_update(
+            "delete_jobs",
+            {
+                "status": "eq.processing",
+            },
+            {
+                "status": "pending",
+                "error_message": "Recovered after restart.",
+            },
+        )
+
+        jobs = await db_select(
+            "delete_jobs",
+            params=[
+                (
+                    "status",
+                    "eq.pending",
+                ),
+                (
+                    "order",
+                    "created_at.asc",
+                ),
+                (
+                    "limit",
+                    "100",
+                ),
+            ],
+        )
+
+        logger.info(
+            "JOB RECOVERY | found=%s",
+            len(jobs),
+        )
+
+        for job in jobs:
+
+            start_job(
+                bot,
+                job,
+            )
+
+    except Exception:
+
+        logger.exception(
+            "JOB RECOVERY ERROR"
+        )
+
+
+# =========================================================
+# DELETE JOB WORKER
+# =========================================================
+
+async def delete_job_worker(
+    bot: Bot,
+):
+
+    logger.info(
+        "DELETE JOB WORKER STARTED"
+    )
+
+    await recover_jobs(
+        bot
+    )
+
+    while True:
+
+        try:
+
+            jobs = await db_select(
+                "delete_jobs",
+                params=[
+                    (
+                        "status",
+                        "eq.pending",
+                    ),
+                    (
+                        "order",
+                        "created_at.asc",
+                    ),
+                    (
+                        "limit",
+                        "20",
+                    ),
+                ],
+            )
+
+            for job in jobs:
+
+                start_job(
+                    bot,
+                    job,
+                )
+
+            await safe_sleep(
+                JOB_CHECK_INTERVAL
+            )
+
+        except asyncio.CancelledError:
+
+            raise
+
+        except Exception:
+
+            logger.exception(
+                "DELETE JOB WORKER ERROR"
+            )
+
+            await safe_sleep(2)
 
 
 # =========================================================
 # DELETE COMMAND
 # =========================================================
 
+# =========================================================
+# DELETE COMMAND - GROUP ADMIN ONLY
+# =========================================================
+
 @router.message(
     Command("delete"),
     F.chat.type.in_({
         "group",
-        "supergroup"
+        "supergroup",
     }),
 )
 async def delete_handler(
-    message: Message
+    message: Message,
 ):
-
-    chat_id = message.chat.id
-
-    # -----------------------------------------------------
-    # ARGUMENT
-    # -----------------------------------------------------
-
     if not message.text:
-
         return
+
+    # =====================================================
+    # USER CHECK
+    # =====================================================
+
+    if not message.from_user:
+        return
+
+    user_id = message.from_user.id
+
+    # =====================================================
+    # GROUP ADMIN CHECK
+    # =====================================================
+
+    try:
+        user_member = await message.bot.get_chat_member(
+            chat_id=message.chat.id,
+            user_id=user_id,
+        )
+
+        # Only group owner/admin allowed
+        if user_member.status not in {
+            "administrator",
+            "creator",
+        }:
+            await message.reply(
+                "❌ Sirf Group Admin / Owner "
+                "/delete command use kar sakta hai."
+            )
+            return
+
+    except TelegramNetworkError:
+        await message.reply(
+            "⚠️ Telegram network error aaya.\n"
+            "Thodi der baad try karo."
+        )
+        return
+
+    except TelegramForbiddenError:
+        await message.reply(
+            "❌ Admin status check nahi ho paaya."
+        )
+        return
+
+    except TelegramBadRequest:
+        await message.reply(
+            "❌ User admin status check nahi ho paaya."
+        )
+        return
+
+    except Exception:
+        logger.exception(
+            "GROUP ADMIN CHECK ERROR | chat=%s | user=%s",
+            message.chat.id,
+            user_id,
+        )
+
+        await message.reply(
+            "❌ Admin permission check failed."
+        )
+        return
+
+    # =====================================================
+    # DURATION
+    # =====================================================
 
     args = message.text.split()
 
     if len(args) < 2:
-
         await message.reply(
-
             "❌ Time missing.\n\n"
-
             "Examples:\n"
-
             "/delete 5m\n"
+            "/delete 10m\n"
             "/delete 1h\n"
+            "/delete 2h\n"
             "/delete 1d\n"
             "/delete 7d"
         )
-
         return
 
     duration_text = (
@@ -683,31 +1655,20 @@ async def delete_handler(
     )
 
     if seconds is None:
-
         await message.reply(
-
             "❌ Invalid time.\n\n"
-
             "Use:\n"
             "• m = minutes\n"
             "• h = hours\n"
             "• d = days\n\n"
-
             "Examples:\n"
-
-            "🗑 /delete 7m\n"
-            "🗑 /delete 2h\n"
-            "🗑 /delete 1d\n"
-            "🗑 /delete 7d\n\n"
-
+            "/delete 7m\n"
+            "/delete 2h\n"
+            "/delete 1d\n"
+            "/delete 7d\n\n"
             f"📌 Maximum: {MAX_TRACK_DAYS}d"
         )
-
         return
-
-    # -----------------------------------------------------
-    # COMMAND TIMESTAMP
-    # -----------------------------------------------------
 
     command_time = time.time()
 
@@ -715,32 +1676,27 @@ async def delete_handler(
         command_time - seconds
     )
 
-    # -----------------------------------------------------
-    # CHECK BOT ADMIN
-    # -----------------------------------------------------
+    # =====================================================
+    # BOT PERMISSION CHECK
+    # =====================================================
 
     try:
+        me = await message.bot.get_me()
 
-        me = await bot.get_me()
-
-        member = await bot.get_chat_member(
-            chat_id=chat_id,
+        member = await message.bot.get_chat_member(
+            chat_id=message.chat.id,
             user_id=me.id,
         )
 
-        if member.status not in (
+        if member.status not in {
             "administrator",
-            "creator"
-        ):
-
+            "creator",
+        }:
             await message.reply(
-
                 "❌ Bot admin nahi hai.\n\n"
-
                 "Bot ko Administrator banao aur "
                 "Delete Messages permission ON karo."
             )
-
             return
 
         if member.status == "administrator":
@@ -748,136 +1704,335 @@ async def delete_handler(
             can_delete = getattr(
                 member,
                 "can_delete_messages",
-                False
+                False,
             )
 
             if not can_delete:
-
                 await message.reply(
-
                     "❌ Bot ke paas "
                     "Delete Messages "
                     "permission nahi hai."
                 )
-
                 return
 
-    except Exception as e:
+    except TelegramNetworkError:
+        await message.reply(
+            "⚠️ Telegram network error aaya.\n"
+            "Thodi der baad try karo."
+        )
+        return
 
+    except TelegramForbiddenError:
+        await message.reply(
+            "❌ Permission check reject hua.\n"
+            "Bot ko group Administrator banao."
+        )
+        return
+
+    except TelegramBadRequest:
+        await message.reply(
+            "❌ Bot permission check failed."
+        )
+        return
+
+    except Exception:
         logger.exception(
-            "PERMISSION CHECK ERROR | %s",
-            e,
+            "BOT PERMISSION CHECK ERROR"
         )
 
         await message.reply(
             "❌ Bot permission check nahi ho paayi."
         )
-
         return
 
-    # -----------------------------------------------------
-    # SAVE /DELETE COMMAND ITSELF
-    # -----------------------------------------------------
+    # =====================================================
+    # SAVE COMMAND MESSAGE
+    # =====================================================
 
-    add_message_to_history(
-        chat_id=chat_id,
-        message_id=message.message_id,
-        message_time=command_time,
-    )
+    try:
+        await db_insert(
+            "tracked_messages",
+            {
+                "chat_id": message.chat.id,
+                "message_id": message.message_id,
+                "sender_id": user_id,
+                "media_type": "text",
+                "message_time": utc_iso(
+                    command_time
+                ),
+            },
+        )
 
-    # -----------------------------------------------------
-    # CREATE MEMORY JOB
-    # -----------------------------------------------------
+    except Exception:
+        logger.exception(
+            "COMMAND MESSAGE SAVE ERROR"
+        )
 
-    job = {
+    # =====================================================
+    # CREATE PERSISTENT JOB
+    # =====================================================
 
-        "chat_id": chat_id,
+    job = None
 
-        "requested_by": (
-            message.from_user.id
-            if message.from_user
-            else 0
-        ),
+    try:
+        rows = await db_insert(
+            "delete_jobs",
+            {
+                "chat_id": message.chat.id,
+                "requested_by": user_id,
+                "duration_text": duration_text,
+                "duration_seconds": seconds,
+                "start_time": utc_iso(
+                    start_time
+                ),
+                "end_time": utc_iso(
+                    command_time
+                ),
+                "status": "pending",
+            },
+            return_data=True,
+        )
 
-        "duration_text": duration_text,
+        if rows and isinstance(rows, list):
+            job = rows[0]
 
-        "duration_seconds": seconds,
+    except Exception:
+        logger.exception(
+            "CREATE DELETE JOB ERROR"
+        )
 
-        "start_time": start_time,
+        await message.reply(
+            "❌ Delete job create nahi ho paayi.\n"
+            "Database error."
+        )
+        return
 
-        "end_time": command_time,
-    }
+    # =====================================================
+    # FALLBACK JOB FETCH
+    # =====================================================
 
-    pending_jobs.append(job)
+    if not job:
 
-    # -----------------------------------------------------
-    # CONFIRM
-    # -----------------------------------------------------
+        try:
+            latest = await db_select(
+                "delete_jobs",
+                params=[
+                    (
+                        "chat_id",
+                        f"eq.{message.chat.id}",
+                    ),
+                    (
+                        "requested_by",
+                        f"eq.{user_id}",
+                    ),
+                    (
+                        "status",
+                        "eq.pending",
+                    ),
+                    (
+                        "order",
+                        "created_at.desc",
+                    ),
+                    (
+                        "limit",
+                        "1",
+                    ),
+                ],
+            )
+
+            if latest:
+                job = latest[0]
+
+        except Exception:
+            logger.exception(
+                "GET CREATED JOB ERROR"
+            )
+
+    # =====================================================
+    # CONFIRMATION
+    # =====================================================
 
     await message.reply(
-
         "🗑 Delete request received\n\n"
-
+        f"👤 Admin: {message.from_user.full_name}\n"
         f"⏱ Range: {duration_text}\n"
-
-        "⚡ Delete process queue me hai.\n\n"
-
+        "⚡ Delete process queue me hai.\n"
+        "🔄 Restart ke baad bhi job recover hogi.\n\n"
         "📌 Command ke baad aane wale "
         "messages is request me delete nahi honge."
     )
 
+    # =====================================================
+    # START JOB
+    # =====================================================
+
+    if job:
+        start_job(
+            message.bot,
+            job,
+        )
+
     logger.info(
-
-        "DELETE REQUEST | chat=%s | duration=%s | start=%s | end=%s",
-
-        chat_id,
-
+        "DELETE REQUEST | chat=%s | admin=%s | duration=%s | job=%s",
+        message.chat.id,
+        user_id,
         duration_text,
-
-        start_time,
-
-        command_time,
+        job.get("id") if job else None,
     )
 
 
 # =========================================================
-# PRIVATE DELETE COMMAND
+# PRIVATE DELETE
 # =========================================================
 
 @router.message(
-    Command("delete")
+    Command("delete"),
 )
 async def private_delete_handler(
-    message: Message
+    message: Message,
 ):
 
     if message.chat.type == "private":
 
         await message.answer(
-
             "ℹ️ /delete group/supergroup me use karo.\n\n"
-
+            "👮 Sirf Group Admin / Owner command use kar sakta hai.\n\n"
             "Example:\n"
-
             "/delete 5m"
         )
 
+# =========================================================
+# GET BROADCAST USERS
+# =========================================================
+
+async def get_broadcast_users():
+
+    rows = await db_select(
+        "bot_users",
+        params=[
+            (
+                "select",
+                "user_id",
+            ),
+            (
+                "order",
+                "user_id.asc",
+            ),
+            (
+                "limit",
+                "200000",
+            ),
+        ],
+    )
+
+    users = []
+
+    for row in rows:
+
+        try:
+
+            users.append(
+                int(
+                    row["user_id"]
+                )
+            )
+
+        except Exception:
+
+            pass
+
+    return users
+
 
 # =========================================================
-# BROADCAST COMMAND
+# BROADCAST SEND ONE
 # =========================================================
-#
-# METHOD 1:
-#
-# /broadcast Hello everyone
-#
-# METHOD 2:
-#
-# Kisi message ko reply karo:
-# /broadcast
-#
-# Isse replied message broadcast hoga.
-#
+
+async def broadcast_to_user(
+    bot: Bot,
+    user_id: int,
+    source_message,
+    broadcast_text,
+):
+
+    while True:
+
+        try:
+
+            if source_message:
+
+                await bot.copy_message(
+                    chat_id=user_id,
+                    from_chat_id=(
+                        source_message.chat.id
+                    ),
+                    message_id=(
+                        source_message.message_id
+                    ),
+                )
+
+            else:
+
+                await bot.send_message(
+                    chat_id=user_id,
+                    text=broadcast_text,
+                )
+
+            return "sent"
+
+        except TelegramRetryAfter as e:
+
+            wait = (
+                float(e.retry_after)
+                + 0.5
+            )
+
+            logger.warning(
+                "BROADCAST FLOOD WAIT | user=%s | wait=%.1f",
+                user_id,
+                wait,
+            )
+
+            await safe_sleep(
+                wait
+            )
+
+        except TelegramNetworkError as e:
+
+            logger.warning(
+                "BROADCAST NETWORK ERROR | user=%s | %s",
+                user_id,
+                e,
+            )
+
+            await safe_sleep(2)
+
+        except TelegramForbiddenError:
+
+            return "blocked"
+
+        except TelegramBadRequest as e:
+
+            logger.warning(
+                "BROADCAST BAD REQUEST | user=%s | %s",
+                user_id,
+                e,
+            )
+
+            return "failed"
+
+        except Exception:
+
+            logger.exception(
+                "BROADCAST UNKNOWN ERROR | user=%s",
+                user_id,
+            )
+
+            return "failed"
+
+
+# =========================================================
+# BROADCAST
 # =========================================================
 
 @router.message(
@@ -885,20 +2040,15 @@ async def private_delete_handler(
     F.chat.type == "private",
 )
 async def broadcast_handler(
-    message: Message
+    message: Message,
 ):
 
-    # -----------------------------------------------------
-    # ADMIN CHECK
-    # -----------------------------------------------------
-
     if not message.from_user:
-
         return
 
-    admin_id = message.from_user.id
-
-    if not is_admin(admin_id):
+    if not is_admin(
+        message.from_user.id
+    ):
 
         await message.answer(
             "❌ Unauthorized.\n\n"
@@ -907,108 +2057,36 @@ async def broadcast_handler(
 
         return
 
-    # -----------------------------------------------------
-    # CHECK USERS
-    # -----------------------------------------------------
+    source_message = (
+        message.reply_to_message
+    )
 
-    if not broadcast_users:
+    broadcast_text = None
 
-        await message.answer(
-
-            "⚠️ No users found.\n\n"
-
-            "Abhi kisi user ne bot me "
-            "/start nahi kiya."
-        )
-
-        return
-
-    # -----------------------------------------------------
-    # DETERMINE BROADCAST MESSAGE
-    # -----------------------------------------------------
-
-    source_message = None
-
-    # -----------------------------------------------------
-    # REPLY MODE
-    # -----------------------------------------------------
-
-    if message.reply_to_message:
-
-        source_message = message.reply_to_message
-
-    # -----------------------------------------------------
-    # TEXT MODE
-    # -----------------------------------------------------
-
-    elif message.text:
+    if (
+        not source_message
+        and message.text
+    ):
 
         parts = message.text.split(
             maxsplit=1
         )
 
-        if len(parts) >= 2:
+        if len(parts) == 2:
 
-            broadcast_text = parts[1].strip()
-
-            if broadcast_text:
-
-                # Text broadcast handled separately below
-                source_message = None
-
-            else:
-
-                broadcast_text = None
-
-        else:
-
-            broadcast_text = None
-
-    else:
-
-        broadcast_text = None
-
-    # -----------------------------------------------------
-    # TEXT VALUE
-    # -----------------------------------------------------
-
-    if not message.reply_to_message:
-
-        if message.text:
-
-            parts = message.text.split(
-                maxsplit=1
+            broadcast_text = (
+                parts[1].strip()
             )
 
-            if len(parts) >= 2:
-
-                broadcast_text = parts[1].strip()
-
-            else:
-
-                broadcast_text = None
-
-        else:
-
-            broadcast_text = None
-
-    else:
-
-        broadcast_text = None
-
-    # -----------------------------------------------------
-    # NOTHING PROVIDED
-    # -----------------------------------------------------
-
-    if source_message is None and not broadcast_text:
+    if (
+        not source_message
+        and not broadcast_text
+    ):
 
         await message.answer(
-
             "📢 Broadcast Usage\n\n"
-
             "Text:\n"
             "/broadcast Hello everyone\n\n"
-
             "Photo / Video / Document / Audio:\n"
             "1. Pehle message send karo\n"
             "2. Us message ko reply karo\n"
@@ -1017,182 +2095,225 @@ async def broadcast_handler(
 
         return
 
-    # -----------------------------------------------------
-    # COPY USER LIST
-    # -----------------------------------------------------
+    try:
+
+        users = await get_broadcast_users()
+
+    except Exception:
+
+        logger.exception(
+            "GET BROADCAST USERS ERROR"
+        )
+
+        await message.answer(
+            "❌ Database se users fetch nahi ho paaye."
+        )
+
+        return
+
+    if not users:
+
+        await message.answer(
+            "⚠️ No users found.\n\n"
+            "Abhi kisi user ne bot me /start nahi kiya."
+        )
+
+        return
 
     users = list(
-        broadcast_users
+        dict.fromkeys(users)
     )
 
     total = len(users)
 
     sent = 0
-
     failed = 0
-
-    blocked_users = []
-
-    # -----------------------------------------------------
-    # START MESSAGE
-    # -----------------------------------------------------
+    blocked = 0
+    processed = 0
 
     progress_message = await message.answer(
-
         "📢 Broadcast Started\n\n"
-
         f"👥 Users: {total}\n"
+        "📨 Processed: 0\n"
         "✅ Sent: 0\n"
         "❌ Failed: 0\n"
+        "🚫 Blocked: 0\n"
         "⏳ Progress: 0%"
     )
 
-    # -----------------------------------------------------
-    # LOCK
-    # -----------------------------------------------------
-
     async with broadcast_lock:
 
-        for index, user_id in enumerate(
-            users,
-            start=1
+        # Moderate concurrency to avoid Telegram flood limits.
+        concurrency = 8
+
+        for start in range(
+            0,
+            total,
+            concurrency,
         ):
 
-            try:
+            batch_users = users[
+                start:start + concurrency
+            ]
 
-                # -------------------------------------------------
-                # COPY REPLIED MESSAGE
-                # -------------------------------------------------
+            tasks = [
+                broadcast_to_user(
+                    message.bot,
+                    user_id,
+                    source_message,
+                    broadcast_text,
+                )
+                for user_id in batch_users
+            ]
 
-                if source_message:
+            results = await asyncio.gather(
+                *tasks,
+                return_exceptions=True,
+            )
 
-                    await bot.copy_message(
+            for user_id, result in zip(
+                batch_users,
+                results,
+            ):
 
-                        chat_id=user_id,
+                processed += 1
 
-                        from_chat_id=source_message.chat.id,
+                if result == "sent":
 
-                        message_id=source_message.message_id,
-                    )
+                    sent += 1
 
-                # -------------------------------------------------
-                # SEND TEXT
-                # -------------------------------------------------
+                elif result == "blocked":
+
+                    blocked += 1
+                    failed += 1
 
                 else:
 
-                    await bot.send_message(
-
-                        chat_id=user_id,
-
-                        text=broadcast_text,
-                    )
-
-                sent += 1
-
-                logger.info(
-
-                    "BROADCAST SENT | user=%s | %s/%s",
-
-                    user_id,
-
-                    index,
-
-                    total,
-                )
-
-            except Exception as e:
-
-                failed += 1
-
-                blocked_users.append(
-                    user_id
-                )
-
-                logger.warning(
-
-                    "BROADCAST FAILED | user=%s | %s",
-
-                    user_id,
-
-                    e,
-                )
-
-            # -------------------------------------------------
-            # PROGRESS UPDATE
-            # -------------------------------------------------
+                    failed += 1
 
             if (
-                index == 1
-                or index % 10 == 0
-                or index == total
+                processed == total
+                or processed % BROADCAST_PROGRESS_EVERY == 0
+                or processed >= BROADCAST_PROGRESS_EVERY
             ):
 
                 percent = int(
-                    (index / total) * 100
+                    (
+                        processed
+                        / total
+                    ) * 100
                 )
 
                 try:
 
                     await progress_message.edit_text(
-
                         "📢 Broadcasting...\n\n"
-
                         f"👥 Total: {total}\n"
-                        f"📨 Processed: {index}\n"
+                        f"📨 Processed: {processed}\n"
                         f"✅ Sent: {sent}\n"
                         f"❌ Failed: {failed}\n"
+                        f"🚫 Blocked: {blocked}\n"
                         f"⏳ Progress: {percent}%"
+                    )
+
+                except TelegramRetryAfter as e:
+
+                    await safe_sleep(
+                        float(e.retry_after)
+                        + 0.5
                     )
 
                 except Exception:
 
                     pass
 
-            await asyncio.sleep(
+            await safe_sleep(
                 BROADCAST_DELAY
             )
 
-    # -----------------------------------------------------
-    # REMOVE FAILED USERS
-    # -----------------------------------------------------
+    try:
 
-    for user_id in blocked_users:
-
-        broadcast_users.discard(
-            user_id
+        await progress_message.edit_text(
+            "✅ Broadcast Completed\n\n"
+            f"👥 Total: {total}\n"
+            f"📨 Sent: {sent}\n"
+            f"❌ Failed: {failed}\n"
+            f"🚫 Blocked/Unavailable: {blocked}\n"
         )
 
-    # -----------------------------------------------------
-    # FINAL RESULT
-    # -----------------------------------------------------
+    except Exception:
 
-    await progress_message.edit_text(
-
-        "✅ Broadcast Completed\n\n"
-
-        f"👥 Total: {total}\n"
-        f"📨 Sent: {sent}\n"
-        f"❌ Failed: {failed}\n"
-        f"🚫 Removed: {len(blocked_users)}\n\n"
-
-        f"📊 Current Users: {len(broadcast_users)}"
-    )
+        logger.exception(
+            "FINAL BROADCAST MESSAGE ERROR"
+        )
 
     logger.info(
-
         "BROADCAST COMPLETE | total=%s | sent=%s | failed=%s",
-
         total,
-
         sent,
-
         failed,
     )
 
 
 # =========================================================
-# STATS COMMAND
+# EXACT DATABASE COUNT
+# =========================================================
+
+async def get_exact_count(
+    table: str,
+    params=None,
+):
+
+    response = await supabase_client.get(
+        f"/{table}",
+        params=params,
+        headers={
+            "Prefer": "count=exact",
+        },
+    )
+
+    if not (
+        200 <= response.status_code < 300
+    ):
+
+        raise RuntimeError(
+            f"Count failed: "
+            f"{response.status_code} "
+            f"{response.text[:500]}"
+        )
+
+    content_range = response.headers.get(
+        "content-range",
+        "",
+    )
+
+    if "/" in content_range:
+
+        try:
+
+            return int(
+                content_range.split(
+                    "/"
+                )[1]
+            )
+
+        except Exception:
+
+            pass
+
+    try:
+
+        data = response.json()
+
+        return len(data)
+
+    except Exception:
+
+        return 0
+
+
+# =========================================================
+# STATS
 # =========================================================
 
 @router.message(
@@ -1200,11 +2321,10 @@ async def broadcast_handler(
     F.chat.type == "private",
 )
 async def stats_handler(
-    message: Message
+    message: Message,
 ):
 
     if not message.from_user:
-
         return
 
     if not is_admin(
@@ -1217,21 +2337,258 @@ async def stats_handler(
 
         return
 
-    await message.answer(
+    try:
 
-        "📊 Bot Statistics\n\n"
+        users = await get_exact_count(
+            "bot_users",
+            params=[
+                (
+                    "select",
+                    "user_id",
+                )
+            ],
+        )
 
-        f"👥 Broadcast Users: "
-        f"{len(broadcast_users)}\n\n"
+        tracked = await get_exact_count(
+            "tracked_messages",
+            params=[
+                (
+                    "select",
+                    "id",
+                )
+            ],
+        )
 
-        f"🗑 Pending Delete Jobs: "
-        f"{len(pending_jobs)}\n\n"
+        pending = await get_exact_count(
+            "delete_jobs",
+            params=[
+                (
+                    "select",
+                    "id",
+                ),
+                (
+                    "status",
+                    "eq.pending",
+                ),
+            ],
+        )
 
-        f"💾 Storage: RAM Only\n"
+        processing = await get_exact_count(
+            "delete_jobs",
+            params=[
+                (
+                    "select",
+                    "id",
+                ),
+                (
+                    "status",
+                    "eq.processing",
+                ),
+            ],
+        )
 
-        f"⏱ Max Tracking: "
-        f"{MAX_TRACK_DAYS} days"
+        completed = await get_exact_count(
+            "delete_jobs",
+            params=[
+                (
+                    "select",
+                    "id",
+                ),
+                (
+                    "status",
+                    "eq.completed",
+                ),
+            ],
+        )
+
+        await message.answer(
+            "📊 Bot Statistics\n\n"
+            f"👥 Users: {users}\n\n"
+            f"💬 Tracked Messages: {tracked}\n\n"
+            f"⏳ Pending Jobs: {pending}\n"
+            f"⚙️ Processing Jobs: {processing}\n"
+            f"✅ Completed Jobs: {completed}\n\n"
+            "💾 Storage: Supabase\n"
+            f"⏱ Tracking: {MAX_TRACK_DAYS} days"
+        )
+
+    except Exception:
+
+        logger.exception(
+            "STATS ERROR"
+        )
+
+        await message.answer(
+            "❌ Stats database se fetch nahi ho paaye."
+        )
+
+
+# =========================================================
+# CLEANUP OLD MESSAGES
+# =========================================================
+
+async def cleanup_worker():
+
+    logger.info(
+        "DATABASE CLEANUP WORKER STARTED"
     )
+
+    while True:
+
+        try:
+
+            cutoff = utc_iso(
+                time.time()
+                - TRACK_SECONDS
+            )
+
+            await db_delete(
+                "tracked_messages",
+                {
+                    "message_time": (
+                        f"lt.{cutoff}"
+                    ),
+                },
+            )
+
+            logger.info(
+                "OLD MESSAGE CLEANUP COMPLETE | before=%s",
+                cutoff,
+            )
+
+        except Exception:
+
+            logger.exception(
+                "CLEANUP ERROR"
+            )
+
+        await asyncio.sleep(
+            6 * 60 * 60
+        )
+
+
+# =========================================================
+# DATABASE CHECK
+# =========================================================
+
+async def database_check():
+
+    try:
+
+        await db_select(
+            "tracked_messages",
+            params=[
+                (
+                    "select",
+                    "id",
+                ),
+                (
+                    "limit",
+                    "1",
+                ),
+            ],
+        )
+
+        logger.info(
+            "SUPABASE CONNECTED"
+        )
+
+        return True
+
+    except Exception:
+
+        logger.exception(
+            "SUPABASE CONNECTION FAILED"
+        )
+
+        return False
+
+
+# =========================================================
+# POLLING
+# =========================================================
+
+async def polling_loop(
+    bot: Bot,
+):
+
+    retry_delay = POLL_RETRY_MIN
+
+    while True:
+
+        try:
+
+            logger.info(
+                "START POLLING"
+            )
+
+            await dp.start_polling(
+                bot,
+                allowed_updates=(
+                    dp.resolve_used_update_types()
+                ),
+                handle_signals=False,
+            )
+
+            logger.warning(
+                "POLLING STOPPED | reconnect in %ss",
+                retry_delay,
+            )
+
+            await safe_sleep(
+                retry_delay
+            )
+
+            retry_delay = min(
+                retry_delay * 2,
+                POLL_RETRY_MAX,
+            )
+
+        except TelegramUnauthorizedError:
+
+            logger.critical(
+                "TELEGRAM UNAUTHORIZED | "
+                "BOT TOKEN INVALID/REVOKED"
+            )
+
+            raise
+
+        except TelegramNetworkError as e:
+
+            logger.error(
+                "TELEGRAM NETWORK ERROR | %s | reconnect in %ss",
+                e,
+                retry_delay,
+            )
+
+            await safe_sleep(
+                retry_delay
+            )
+
+            retry_delay = min(
+                retry_delay * 2,
+                POLL_RETRY_MAX,
+            )
+
+        except asyncio.CancelledError:
+
+            raise
+
+        except Exception:
+
+            logger.exception(
+                "POLLING UNKNOWN ERROR | reconnect in %ss",
+                retry_delay,
+            )
+
+            await safe_sleep(
+                retry_delay
+            )
+
+            retry_delay = min(
+                retry_delay * 2,
+                POLL_RETRY_MAX,
+            )
 
 
 # =========================================================
@@ -1240,92 +2597,196 @@ async def stats_handler(
 
 async def main():
 
+    global supabase_client
+
+    # =====================================================
+    # CONFIG VALIDATION
+    # =====================================================
+
     if (
         not BOT_TOKEN
-        or BOT_TOKEN == "PUT_YOUR_NEW_BOT_TOKEN_HERE"
+        or BOT_TOKEN == "PUT_NEW_BOT_TOKEN_HERE"
     ):
 
         raise RuntimeError(
-
-            "BOT_TOKEN me apna NEW Telegram "
-            "BotFather token daalo."
+            "BOT_TOKEN set karo."
         )
 
-    # -----------------------------------------------------
-    # CHECK ADMIN CONFIG
-    # -----------------------------------------------------
+    if (
+        not SUPABASE_URL
+        or "YOUR_PROJECT" in SUPABASE_URL
+    ):
+
+        raise RuntimeError(
+            "SUPABASE_URL set karo."
+        )
+
+    if (
+        not SUPABASE_SERVICE_KEY
+        or SUPABASE_SERVICE_KEY
+        == "PUT_SUPABASE_SERVICE_ROLE_KEY_HERE"
+    ):
+
+        raise RuntimeError(
+            "SUPABASE_SERVICE_KEY set karo."
+        )
 
     if not ADMIN_IDS:
 
         raise RuntimeError(
-
-            "ADMIN_IDS me apna Telegram numeric "
-            "user ID daalo."
+            "ADMIN_IDS empty hai."
         )
 
-    # -----------------------------------------------------
-    # BOT INFO
-    # -----------------------------------------------------
+    # =====================================================
+    # SUPABASE
+    # =====================================================
 
-    me = await bot.get_me()
-
-    logger.info(
-        "========================================"
+    supabase_client = (
+        create_supabase_client()
     )
 
-    logger.info(
-        "BOT CONNECTED: @%s",
-        me.username,
+    db_ok = await database_check()
+
+    if not db_ok:
+
+        await supabase_client.aclose()
+
+        raise RuntimeError(
+            "Supabase connection failed."
+        )
+
+    # =====================================================
+    # BOT
+    # =====================================================
+
+    bot = Bot(
+        token=BOT_TOKEN
     )
 
-    logger.info(
-        "STORAGE: RAM ONLY"
+    # =====================================================
+    # BACKGROUND TASKS
+    # =====================================================
+
+    message_worker_task = (
+        asyncio.create_task(
+            message_db_worker()
+        )
     )
 
-    logger.info(
-        "BROADCAST USERS: %s",
-        len(broadcast_users),
+    delete_worker_task = (
+        asyncio.create_task(
+            delete_job_worker(bot)
+        )
     )
 
-    logger.info(
-        "MAX TRACK: %s DAYS",
-        MAX_TRACK_DAYS,
-    )
-
-    logger.info(
-        "========================================"
-    )
-
-    # -----------------------------------------------------
-    # START DELETE WORKER
-    # -----------------------------------------------------
-
-    worker_task = asyncio.create_task(
-        delete_worker()
+    cleanup_task = (
+        asyncio.create_task(
+            cleanup_worker()
+        )
     )
 
     try:
 
-        await dp.start_polling(
+        me = await bot.get_me()
 
-            bot,
+        logger.info(
+            "========================================"
+        )
 
-            allowed_updates=dp.resolve_used_update_types(),
+        logger.info(
+            "BOT CONNECTED: @%s | id=%s",
+            me.username,
+            me.id,
+        )
+
+        logger.info(
+            "SUPABASE: CONNECTED"
+        )
+
+        logger.info(
+            "STORAGE: SUPABASE"
+        )
+
+        logger.info(
+            "MAX TRACK: %s DAYS",
+            MAX_TRACK_DAYS,
+        )
+
+        logger.info(
+            "MAX PARALLEL DELETE JOBS: %s",
+            MAX_PARALLEL_DELETE_JOBS,
+        )
+
+        logger.info(
+            "ADMIN IDS: %s",
+            list(ADMIN_IDS),
+        )
+
+        logger.info(
+            "========================================"
+        )
+
+        await polling_loop(
+            bot
         )
 
     finally:
 
-        worker_task.cancel()
+        logger.info(
+            "SHUTTING DOWN..."
+        )
+
+        for task in (
+            message_worker_task,
+            delete_worker_task,
+            cleanup_task,
+        ):
+
+            task.cancel()
+
+        for task in (
+            message_worker_task,
+            delete_worker_task,
+            cleanup_task,
+        ):
+
+            try:
+
+                await task
+
+            except asyncio.CancelledError:
+
+                pass
+
+            except Exception:
+
+                logger.exception(
+                    "BACKGROUND TASK SHUTDOWN ERROR"
+                )
 
         try:
 
-            await worker_task
+            await bot.session.close()
 
-        except asyncio.CancelledError:
+        except Exception:
 
-            pass
+            logger.exception(
+                "BOT SESSION CLOSE ERROR"
+            )
 
-        await bot.session.close()
+        try:
+
+            await supabase_client.aclose()
+
+        except Exception:
+
+            logger.exception(
+                "SUPABASE CLIENT CLOSE ERROR"
+            )
+
+        logger.info(
+            "BOT STOPPED"
+        )
 
 
 # =========================================================
@@ -1340,8 +2801,20 @@ if __name__ == "__main__":
             main()
         )
 
+    except TelegramUnauthorizedError:
+
+        logger.critical(
+            "BOT STOPPED: INVALID/REVOKED TOKEN."
+        )
+
     except KeyboardInterrupt:
 
         logger.info(
-            "BOT STOPPED"
+            "BOT STOPPED BY USER"
+        )
+
+    except Exception:
+
+        logger.exception(
+            "FATAL BOT ERROR"
         )
